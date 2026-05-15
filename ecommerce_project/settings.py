@@ -39,6 +39,10 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'products',
+    # Requirement 4 (Batch Processing): django_celery_beat lets us store
+    # periodic-task schedules in the DB so they can be edited from the
+    # Django admin without redeploying.
+    'django_celery_beat',
 ]
 
 MIDDLEWARE = [
@@ -132,3 +136,45 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_SAVE_EVERY_REQUEST = True
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# =============================================================================
+#  CELERY CONFIGURATION (Requirement 4: Batch Processing)
+# =============================================================================
+# We use Redis as both the broker (where tasks are queued) and the result
+# backend (where task return values are stored).
+#
+# Why Redis (not RabbitMQ/SQS/DB-as-broker)?
+#   * In-memory => very low enqueue/dequeue latency (~sub-ms),
+#     so the batch master can spawn thousands of chunk-tasks quickly.
+#   * Same Redis instance is reusable as a cache (Requirement 6) and as
+#     a coordination primitive for distributed locks (Requirement 7).
+#   * Trivial to run locally for the demo: `redis-server`.
+#
+# The CELERY_ prefix is intentional: celery.py reads keys from settings
+# with namespace='CELERY', and strips the prefix.
+# -----------------------------------------------------------------------------
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+
+# Use JSON for serialization. Pickle is faster but unsafe (RCE if broker
+# is compromised). For an academic project we prefer the safer option.
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+
+CELERY_TIMEZONE = TIME_ZONE  # keep Celery's clock in sync with Django's
+
+# acks_late = a task is only acknowledged AFTER it finishes. If a worker
+# crashes mid-task, the broker re-delivers it to another worker. This is
+# important for batch chunks: we'd rather reprocess a chunk than lose it.
+CELERY_TASK_ACKS_LATE = True
+
+# Each worker prefetches at most 1 task at a time. Without this, a fast
+# worker grabs many tasks and a slow worker stays idle => load is
+# unbalanced. With prefetch=1 we get near-perfect work stealing.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
+# Store schedules in the database (django-celery-beat). This lets us
+# change the schedule from the Django admin without restarting beat.
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'

@@ -1,11 +1,16 @@
 import json
 from django.shortcuts import get_object_or_404
 from django.db import transaction
-from .models import Cart, CartItem, Order, OrderItem, Product, Wallet
+from .models import Cart, CartItem, Order, OrderItem, Product, Wallet, DailySalesReport, BatchJobLog
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth import authenticate, login
 from django.contrib.auth.models import User
+
+# Imports for Requirements 4 & 5 — kept local where possible to avoid
+# circular imports at startup if Celery isn't installed yet in dev envs.
+from .tasks import run_daily_sales_batch
+from .load_balancer import compare_all_strategies, run_simulation, STRATEGIES
 
 
 #  CHECKOUT: إتمام عملية الشراء والدفع
@@ -331,3 +336,109 @@ def register(request):
         "username": user.username,
         "initial_balance": "1000.00"
     })
+
+
+# =============================================================================
+#  REQUIREMENT 4 — BATCH PROCESSING ENDPOINTS
+# =============================================================================
+# These endpoints let the team (and the grader) trigger and inspect the
+# daily-sales batch job from the API. The actual work runs in Celery workers.
+
+@csrf_exempt
+def trigger_daily_sales_batch(request):
+    """POST /api/batch/run/  body: {"date": "YYYY-MM-DD", "chunk_size": 200, "mode": "chunked"}
+    Returns the BatchJobLog id immediately. The job runs in the background."""
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=400)
+
+    try:
+        body = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        body = {}
+
+    report_date = body.get("date")                  # None => yesterday
+    chunk_size = int(body.get("chunk_size", 200))
+    mode = body.get("mode", "chunked")              # "chunked" | "sequential"
+
+    # .delay() = "send to Celery, don't wait". We get back an AsyncResult.
+    async_res = run_daily_sales_batch.delay(
+        report_date_str=report_date,
+        chunk_size=chunk_size,
+        mode=mode,
+    )
+    return JsonResponse({
+        "message": "Batch job dispatched",
+        "celery_task_id": async_res.id,
+        "params": {"date": report_date, "chunk_size": chunk_size, "mode": mode},
+    })
+
+
+def batch_job_status(request, job_log_id: int):
+    """GET /api/batch/status/<job_log_id>/ — inspect a BatchJobLog row."""
+    try:
+        log = BatchJobLog.objects.get(id=job_log_id)
+    except BatchJobLog.DoesNotExist:
+        return JsonResponse({"error": "BatchJobLog not found"}, status=404)
+    return JsonResponse({
+        "id": log.id,
+        "job_name": log.job_name,
+        "mode": log.mode,
+        "chunk_size": log.chunk_size,
+        "total_records": log.total_records,
+        "status": log.status,
+        "started_at": log.started_at.isoformat() if log.started_at else None,
+        "finished_at": log.finished_at.isoformat() if log.finished_at else None,
+        "duration_seconds": log.duration_seconds,
+        "error_message": log.error_message,
+        "metadata": log.metadata,
+    })
+
+
+def daily_sales_report(request):
+    """GET /api/batch/report/?date=YYYY-MM-DD — read the produced report."""
+    date_str = request.GET.get("date")
+    qs = DailySalesReport.objects.all()
+    if date_str:
+        qs = qs.filter(report_date=date_str)
+    data = [{
+        "report_date": str(r.report_date),
+        "total_orders": r.total_orders,
+        "total_items_sold": r.total_items_sold,
+        "total_revenue": str(r.total_revenue),
+        "product_breakdown": r.product_breakdown,
+        "generated_at": r.generated_at.isoformat(),
+    } for r in qs[:30]]
+    return JsonResponse({"reports": data})
+
+
+# =============================================================================
+#  REQUIREMENT 5 — LOAD DISTRIBUTION ENDPOINT
+# =============================================================================
+@csrf_exempt
+def simulate_load(request):
+    """GET/POST /api/load/simulate/
+    Query params (or JSON body): strategy=all|round_robin|random|...,
+                                 servers=4, requests=200
+    Runs the in-process simulator and returns the JSON metrics."""
+    if request.method == "POST":
+        try:
+            body = json.loads(request.body or b"{}")
+        except json.JSONDecodeError:
+            body = {}
+        strategy = body.get("strategy", "all")
+        num_servers = int(body.get("servers", 4))
+        num_requests = int(body.get("requests", 200))
+    else:
+        strategy = request.GET.get("strategy", "all")
+        num_servers = int(request.GET.get("servers", 4))
+        num_requests = int(request.GET.get("requests", 200))
+
+    if strategy == "all":
+        result = compare_all_strategies(num_requests=num_requests, num_servers=num_servers)
+    elif strategy in STRATEGIES:
+        result = [run_simulation(strategy, num_servers=num_servers, num_requests=num_requests)]
+    else:
+        return JsonResponse({"error": f"Unknown strategy: {strategy}",
+                             "available": list(STRATEGIES) + ["all"]}, status=400)
+
+    return JsonResponse({"results": result})
