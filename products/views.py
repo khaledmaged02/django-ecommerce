@@ -1,6 +1,7 @@
 import json
 from django.shortcuts import get_object_or_404
 from django.db import transaction
+from django.db.models import F
 from .models import Cart, CartItem, Order, OrderItem, Product, Wallet, DailySalesReport, BatchJobLog
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -9,7 +10,7 @@ from django.contrib.auth.models import User
 
 # Imports for Requirements 4 & 5 — kept local where possible to avoid
 # circular imports at startup if Celery isn't installed yet in dev envs.
-from .tasks import run_daily_sales_batch
+from .tasks import run_daily_sales_batch, send_order_notification
 from .load_balancer import compare_all_strategies, run_simulation, STRATEGIES
 
 
@@ -57,11 +58,16 @@ def checkout(request):
     wallet.balance -= total_price
     wallet.save()
 
-    #  تقليل المخزون لكل منتج
+    #  تقليل المخزون لكل منتج باستخدام F() للتحديث الذري (منع Race Condition)
     for item in cart_items:
-        product = item.product
-        product.stock -= item.quantity 
-        product.save()
+        updated = Product.objects.filter(
+            id=item.product.id,
+            stock__gte=item.quantity
+        ).update(stock=F('stock') - item.quantity)
+        if updated == 0:
+            return JsonResponse({
+                "error": f"Stock changed during checkout for {item.product.name}. Please try again."
+            }, status=400)
 
     #  إنشاء طلب جديد في النظام
     order = Order.objects.create(
@@ -81,6 +87,9 @@ def checkout(request):
 
     #  تفريغ السلة بعد الشراء
     cart.items.all().delete()
+
+    #  إرسال إشعار غير متزامن للمستخدم
+    send_order_notification.delay(order.id)
 
     return JsonResponse({
         "message": "Order created successfully",
